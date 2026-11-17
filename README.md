@@ -59,6 +59,14 @@ See [demo](demo) directory for a more feasible example.
 
 A minimal React example for using Recorder with your own UI can be found [here](https://codesandbox.io/s/v67oz43lm7).
 
+The `Recorder` class supports multiple takes: after `stopRecording()`
+resolves, `startRecording()` can be called again on the same instance —
+each take gets a fresh encoder session, and the resolved `Blob` (plus
+`recorder.duration`/`recorder.samples`) always describes exactly the
+recorded samples, excluding the MP3 encoder's delay/padding. Pass
+`{format: "wav"}` to get a 16-bit PCM WAV with the same boundaries
+instead of MP3.
+
 See also [non React demo](https://github.com/addpipe/simple-vmsg-demo) and [Recording mp3 audio in HTML5 using vmsg](https://addpipe.com/blog/recording-mp3-audio-in-html5-using-vmsg-a-webassembly-library-based-on-lame/) article.
 
 ## Development

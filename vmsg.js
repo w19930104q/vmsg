@@ -5,7 +5,22 @@ function pad2(n) {
   return n < 10 ? `0${n}` : `${Math.min(n, 99)}`;
 }
 
-function inlineWorker() {
+// Source of the AudioWorklet processor which forwards captured PCM
+// chunks to the main thread. Loaded from a blob URL so that no separate
+// file needs to be hosted.
+const WORKLET_SOURCE = `
+class VMsgEncoderProcessor extends AudioWorkletProcessor {
+  process(inputs) {
+    const channel = inputs[0] && inputs[0][0];
+    if (channel) this.port.postMessage(channel.slice(0));
+    return true;
+  }
+}
+registerProcessor("vmsg-encoder", VMsgEncoderProcessor);
+`;
+
+// NOTE: exported for tests, not part of the public API.
+export function inlineWorker() {
   // TODO(Kagami): Cache compiled module in IndexedDB? It works in FF
   // and Edge, see: https://github.com/mdn/webassembly-examples/issues/4
   // Though gzipped WASM module currently weights ~70kb so it should be
@@ -55,30 +70,178 @@ function inlineWorker() {
     postMessage({type: "internal-error", data: status});
   }
 
+  function writeAscii(view, offset, str) {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  }
+
+  // Assemble a 16-bit mono PCM WAV from the recorded chunks. The data
+  // chunk contains exactly the recorded samples -- unlike the MP3 frame
+  // stream, no encoder delay/padding is added, so both formats describe
+  // the same [0, samples) boundary.
+  function encodeWAV(chunks, totalSamples, sampleRate) {
+    const bytesPerSample = 2;
+    const dataSize = totalSamples * bytesPerSample;
+    const buf = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buf);
+    writeAscii(view, 0, "RIFF");
+    view.setUint32(4, 36 + dataSize, true);
+    writeAscii(view, 8, "WAVE");
+    writeAscii(view, 12, "fmt ");
+    view.setUint32(16, 16, true);                        // fmt chunk size
+    view.setUint16(20, 1, true);                         // PCM
+    view.setUint16(22, 1, true);                         // mono
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * bytesPerSample, true);
+    view.setUint16(32, bytesPerSample, true);            // block align
+    view.setUint16(34, 8 * bytesPerSample, true);        // bits per sample
+    writeAscii(view, 36, "data");
+    view.setUint32(40, dataSize, true);
+    let offset = 44;
+    for (const chunk of chunks) {
+      for (let i = 0; i < chunk.length; i++, offset += 2) {
+        const s = Math.max(-1, Math.min(1, chunk[i]));
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      }
+    }
+    return new Blob([buf], {type: "audio/wav"});
+  }
+
+  function u32be(buf, offset) {
+    return (buf[offset] << 24 | buf[offset + 1] << 16 |
+            buf[offset + 2] << 8 | buf[offset + 3]) >>> 0;
+  }
+
+  // Parse the Xing/Info + LAME tag of the first MP3 frame to recover the
+  // encoder delay/padding. Those samples are part of the MP3 frame grid
+  // but NOT part of the recording, so they must be excluded from the
+  // recording duration (and are, see `flushSession`).
+  function parseLameTag(mp3) {
+    let offset = 0;
+    // Skip ID3v2 tag if present.
+    if (mp3.length > 10 && mp3[0] === 0x49 && mp3[1] === 0x44 && mp3[2] === 0x33) {
+      offset = 10 + ((mp3[6] & 0x7f) << 21 | (mp3[7] & 0x7f) << 14 |
+                     (mp3[8] & 0x7f) << 7 | (mp3[9] & 0x7f));
+    }
+    if (mp3.length < offset + 0x24 + 4) return null;
+    if (mp3[offset] !== 0xff || (mp3[offset + 1] & 0xe0) !== 0xe0) return null;
+    const version = (mp3[offset + 1] >> 3) & 3;  // 3=MPEG1, 2=MPEG2, 0=MPEG2.5
+    const mono = (mp3[offset + 3] >> 6 & 3) === 3;
+    const sideInfo = version === 3 ? (mono ? 17 : 32) : (mono ? 9 : 17);
+    const xing = offset + 4 + sideInfo;
+    const magic = String.fromCharCode(
+      mp3[xing], mp3[xing + 1], mp3[xing + 2], mp3[xing + 3]);
+    if (magic !== "Xing" && magic !== "Info") return null;
+    const flags = u32be(mp3, xing + 4);
+    let p = xing + 8;
+    let frames = null;
+    if (flags & 1) { frames = u32be(mp3, p); p += 4; }
+    // The LAME extension tag follows the Xing fields; its exact offset
+    // varies between LAME versions, so locate it by signature. The
+    // delay/padding triple lives at +0x15 relative to the tag start.
+    const limit = Math.min(mp3.length - 0x18, xing + 8 + 128);
+    let lame = -1;
+    for (let q = xing + 8; q < limit; q++) {
+      if (mp3[q] === 0x4c && mp3[q + 1] === 0x41 &&    // "LA"
+          mp3[q + 2] === 0x4d && mp3[q + 3] === 0x45) { // "ME"
+        lame = q;
+        break;
+      }
+    }
+    if (lame < 0) return {frames: frames, encDelay: null, encPadding: null};
+    const d0 = mp3[lame + 0x15], d1 = mp3[lame + 0x16], d2 = mp3[lame + 0x17];
+    return {
+      frames: frames,
+      encDelay: (d0 << 4) | (d1 >> 4),
+      encPadding: ((d1 & 0xf) << 8) | d2,
+    };
+  }
+
   let FFI = null;
-  let ref = null;
-  let pcm_l = null;
-  function vmsg_init(rate) {
-    ref = FFI.vmsg_init(rate);
-    if (!ref) return false;
-    const pcm_l_ref = new Uint32Array(memory.buffer, ref, 1)[0];
-    pcm_l = new Float32Array(memory.buffer, pcm_l_ref);
+  // Current encoding session. Every "start" message opens a new session
+  // with a fresh LAME encoder instance; a leftover session (recording
+  // stopped without flush, or start-after-start) is disposed of first so
+  // a stale encoder is never reused for a new take.
+  let session = null;
+
+  function freeSession() {
+    if (session && session.ref) FFI.vmsg_free(session.ref);
+    session = null;
+  }
+
+  function startSession(recId, rate, format) {
+    freeSession();
+    session = {
+      recId: recId,
+      rate: rate,
+      format: format === "wav" ? "wav" : "mp3",
+      ref: null,
+      pcm_l: null,
+      nextSeq: 0,
+      samples: 0,
+      chunks: 0,
+      pcmChunks: format === "wav" ? [] : null,
+    };
+    if (format === "mp3") {
+      const ref = FFI.vmsg_init(rate);
+      if (!ref) {
+        session = null;
+        return false;
+      }
+      const pcm_l_ref = new Uint32Array(memory.buffer, ref, 1)[0];
+      session.ref = ref;
+      session.pcm_l = new Float32Array(memory.buffer, pcm_l_ref);
+    }
     return true;
   }
-  function vmsg_encode(data) {
-    pcm_l.set(data);
-    return FFI.vmsg_encode(ref, data.length) >= 0;
+
+  function encodeChunk(data) {
+    if (session.format === "wav") {
+      session.pcmChunks.push(data);
+    } else {
+      session.pcm_l.set(data);
+      if (FFI.vmsg_encode(session.ref, data.length) < 0) return false;
+    }
+    session.samples += data.length;
+    session.chunks += 1;
+    session.nextSeq += 1;
+    return true;
   }
-  function vmsg_flush() {
-    if (FFI.vmsg_flush(ref) < 0) return null;
-    const mp3_ref = new Uint32Array(memory.buffer, ref + 4, 1)[0];
-    const size = new Uint32Array(memory.buffer, ref + 8, 1)[0];
-    const mp3 = new Uint8Array(memory.buffer, mp3_ref, size);
-    const blob = new Blob([mp3], {type: "audio/mpeg"});
-    FFI.vmsg_free(ref);
-    ref = null;
-    pcm_l = null;
-    return blob;
+
+  function flushSession() {
+    const s = session;
+    session = null;
+    let blob = null;
+    let tag = null;
+    if (s.format === "wav") {
+      blob = encodeWAV(s.pcmChunks, s.samples, s.rate);
+    } else {
+      if (FFI.vmsg_flush(s.ref) < 0) {
+        FFI.vmsg_free(s.ref);
+        return null;
+      }
+      const mp3_ref = new Uint32Array(memory.buffer, s.ref + 4, 1)[0];
+      const size = new Uint32Array(memory.buffer, s.ref + 8, 1)[0];
+      // Copy out of WASM memory before freeing the session.
+      const mp3 = new Uint8Array(memory.buffer, mp3_ref, size).slice();
+      tag = parseLameTag(mp3);
+      blob = new Blob([mp3], {type: "audio/mpeg"});
+      FFI.vmsg_free(s.ref);
+    }
+    return {
+      blob: blob,
+      format: s.format,
+      rate: s.rate,
+      samples: s.samples,
+      chunks: s.chunks,
+      // Duration of the actual recording. LAME delay/padding (present in
+      // the MP3 frame grid) is deliberately excluded here.
+      duration: s.samples / s.rate,
+      frames: tag ? tag.frames : null,
+      encDelay: tag ? tag.encDelay : null,
+      encPadding: tag ? tag.encPadding : null,
+    };
   }
 
   // https://github.com/brion/min-wasm-fail
@@ -129,18 +292,43 @@ function inlineWorker() {
       });
       break;
     case "start":
-      if (!vmsg_init(msg.data)) return postMessage({type: "error", data: "vmsg_init"});
+      if (!startSession(msg.recId, msg.data.rate, msg.data.format))
+        return postMessage({type: "error", data: "vmsg_init"});
+      postMessage({type: "started", recId: msg.recId});
       break;
     case "data":
-      if (!vmsg_encode(msg.data)) return postMessage({type: "error", data: "vmsg_encode"});
+      // Silently drop chunks of stale sessions (e.g. audio callbacks
+      // posted before "stop" was processed, or after a new recording
+      // has already started).
+      if (!session || msg.recId !== session.recId) break;
+      if (msg.seq !== session.nextSeq)
+        return postMessage({type: "error", data: "vmsg_encode: out-of-order chunk " +
+          msg.seq + " (expected " + session.nextSeq + ")"});
+      if (!encodeChunk(msg.data))
+        return postMessage({type: "error", data: "vmsg_encode"});
       break;
     case "stop":
-      const blob = vmsg_flush();
-      if (!blob) return postMessage({type: "error", data: "vmsg_flush"});
-      postMessage({type: "stop", data: blob});
+      if (!session || msg.recId !== session.recId)
+        return postMessage({type: "error", data: "vmsg_flush: no active session"});
+      const result = flushSession();
+      if (!result) return postMessage({type: "error", data: "vmsg_flush"});
+      postMessage({type: "stop", recId: msg.recId, data: result});
       break;
     }
   };
+}
+
+function getUserMedia(constraints) {
+  if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+    return navigator.mediaDevices.getUserMedia(constraints);
+  }
+  const oldGetUserMedia = navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
+  if (!oldGetUserMedia) {
+    return Promise.reject(new Error("getUserMedia is not implemented in this browser"));
+  }
+  return new Promise(function(resolve, reject) {
+    oldGetUserMedia.call(navigator, constraints, resolve, reject);
+  });
 }
 
 export class Recorder {
@@ -151,25 +339,44 @@ export class Recorder {
     this.shimURL = new URL(opts.shimURL || "/static/js/wasm-polyfill.js", location).href;
     this.onStop = onStop;
     this.pitch = opts.pitch || 0;
+    // Output format: "mp3" (default) or "wav". Both formats cover the
+    // exact same sample range; the WAV never includes LAME delay/padding.
+    this.format = opts.format === "wav" ? "wav" : "mp3";
     this.stream = null;
     this.audioCtx = null;
     this.gainNode = null;
     this.pitchFX = null;
     this.encNode = null;
+    this.useWorklet = false;
     this.worker = null;
     this.workerURL = null;
     this.blob = null;
     this.blobURL = null;
-    this.resolve = null;
-    this.reject = null;
+    // Metadata of the last finished recording.
+    this.duration = 0;
+    this.samples = 0;
+    this.chunks = 0;
+    // Recording session state. `recId` is bumped on every start so that
+    // the worker can tell chunks of different takes apart; `seq` numbers
+    // the chunks within one take.
+    this.recording = false;
+    this.recId = 0;
+    this.seq = 0;
+    this.initResolve = null;
+    this.initReject = null;
+    this.startResolve = null;
+    this.startReject = null;
+    this.stopResolve = null;
+    this.stopReject = null;
     Object.seal(this);
   }
 
   close() {
     if (this.encNode) this.encNode.disconnect();
+    if (this.encNode && this.encNode.port) this.encNode.port.onmessage = null;
     if (this.encNode) this.encNode.onaudioprocess = null;
     if (this.stream) this.stopTracks();
-    if (this.audioCtx) this.audioCtx.close();
+    if (this.audioCtx && this.audioCtx.state !== "closed") this.audioCtx.close();
     if (this.worker) {
       this.worker.terminate();
       this.worker = null;
@@ -187,20 +394,6 @@ export class Recorder {
   //                                                  |
   //                                                  -> [worker]
   initAudio() {
-    const getUserMedia = navigator.mediaDevices && navigator.mediaDevices.getUserMedia
-      ? function(constraints) {
-          return navigator.mediaDevices.getUserMedia(constraints);
-        }
-      : function(constraints) {
-          const oldGetUserMedia = navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
-          if (!oldGetUserMedia) {
-            return Promise.reject(new Error("getUserMedia is not implemented in this browser"));
-          }
-          return new Promise(function(resolve, reject) {
-            oldGetUserMedia.call(navigator, constraints, resolve, reject);
-          });
-        };
-
     return getUserMedia({audio: true}).then((stream) => {
       this.stream = stream;
       const audioCtx = this.audioCtx = new (window.AudioContext
@@ -215,12 +408,40 @@ export class Recorder {
       const pitchFX = this.pitchFX = new Jungle(audioCtx);
       pitchFX.setPitchOffset(this.pitch);
 
-      const encNode = this.encNode = (audioCtx.createScriptProcessor
-        || audioCtx.createJavaScriptNode).call(audioCtx, 0, 1, 1);
-      pitchFX.output.connect(encNode);
-
-      gainNode.connect(this.pitch === 0 ? encNode : pitchFX.input);
+      return this.initEncNode(audioCtx).then((encNode) => {
+        this.encNode = encNode;
+        pitchFX.output.connect(encNode);
+        gainNode.connect(this.pitch === 0 ? encNode : pitchFX.input);
+      });
     });
+  }
+
+  // Prefer AudioWorklet (ScriptProcessorNode is deprecated) and fall
+  // back to ScriptProcessorNode when worklets are unavailable.
+  initEncNode(audioCtx) {
+    if (audioCtx.audioWorklet && typeof window.AudioWorkletNode === "function") {
+      const url = URL.createObjectURL(new Blob(
+        [WORKLET_SOURCE], {type: "application/javascript"}));
+      return audioCtx.audioWorklet.addModule(url).then(() => {
+        URL.revokeObjectURL(url);
+        this.useWorklet = true;
+        return new window.AudioWorkletNode(audioCtx, "vmsg-encoder", {
+          numberOfInputs: 1,
+          numberOfOutputs: 1,
+          outputChannelCount: [1],
+        });
+      }, () => {
+        URL.revokeObjectURL(url);
+        return this.createScriptNode(audioCtx);
+      });
+    }
+    return Promise.resolve(this.createScriptNode(audioCtx));
+  }
+
+  createScriptNode(audioCtx) {
+    this.useWorklet = false;
+    return (audioCtx.createScriptProcessor
+      || audioCtx.createJavaScriptNode).call(audioCtx, 0, 1, 1);
   }
 
   initWorker() {
@@ -232,67 +453,124 @@ export class Recorder {
     const workerURL = this.workerURL = URL.createObjectURL(blob);
     const worker = this.worker = new Worker(workerURL);
     const { wasmURL, shimURL } = this;
+    worker.onmessage = (e) => this.onWorkerMessage(e.data);
     worker.postMessage({type: "init", data: {wasmURL, shimURL}});
     return new Promise((resolve, reject) => {
-      worker.onmessage = (e) => {
-        const msg = e.data;
-        switch (msg.type) {
-        case "init":
-          resolve();
-          break;
-        case "init-error":
-          this.close();
-          reject(new Error(msg.data));
-          break;
-        // TODO(Kagami): Error handling.
-        case "error":
-        case "internal-error":
-          this.close();
-          console.error("Worker error:", msg.data);
-          if (this.reject) this.reject(msg.data);
-          break;
-        case "stop":
-          this.blob = msg.data;
-          this.blobURL = URL.createObjectURL(msg.data);
-          if (this.onStop) this.onStop();
-          if (this.resolve) this.resolve(this.blob);
-          break;
-        }
-      }
+      this.initResolve = resolve;
+      this.initReject = reject;
     });
+  }
+
+  onWorkerMessage(msg) {
+    switch (msg.type) {
+    case "init":
+      if (this.initResolve) this.initResolve();
+      break;
+    case "init-error":
+      this.close();
+      if (this.initReject) this.initReject(new Error(msg.data));
+      break;
+    case "started":
+      if (msg.recId !== this.recId) break;
+      if (this.startResolve) this.startResolve();
+      this.startResolve = this.startReject = null;
+      break;
+    case "stop":
+      if (msg.recId !== this.recId) break;
+      this.blob = msg.data.blob;
+      this.blobURL = URL.createObjectURL(msg.data.blob);
+      this.duration = msg.data.duration;
+      this.samples = msg.data.samples;
+      this.chunks = msg.data.chunks;
+      if (this.onStop) this.onStop();
+      if (this.stopResolve) this.stopResolve(this.blob);
+      this.stopResolve = this.stopReject = null;
+      break;
+    case "error":
+    case "internal-error":
+      console.error("Worker error:", msg.data);
+      if (this.startReject) this.startReject(new Error(String(msg.data)));
+      if (this.stopReject) this.stopReject(new Error(String(msg.data)));
+      this.startResolve = this.startReject = null;
+      this.stopResolve = this.stopReject = null;
+      this.close();
+      break;
+    }
   }
 
   init() {
     return this.initAudio().then(this.initWorker.bind(this));
   }
 
+  // Can be called again after stopRecording(): a fresh audio graph and a
+  // fresh encoder session are created for every take. Returns a promise
+  // resolved once the worker has acknowledged the new session.
   startRecording() {
-    if (!this.stream) throw new Error("missing audio initialization");
     if (!this.worker) throw new Error("missing worker initialization");
-    this.blob = null;
-    if (this.blobURL) URL.revokeObjectURL(this.blobURL);
-    this.blobURL = null;
-    this.resolve = null;
-    this.reject = null;
-    this.worker.postMessage({type: "start", data: this.audioCtx.sampleRate});
-    this.encNode.onaudioprocess = (e) => {
-      const samples = e.inputBuffer.getChannelData(0);
-      this.worker.postMessage({type: "data", data: samples});
-    };
-    this.encNode.connect(this.audioCtx.destination);
+    if (this.recording) return Promise.reject(new Error("already recording"));
+    return Promise.resolve()
+      .then(() => {
+        // stopRecording() closes the audio context, so the next take
+        // needs a fresh capture graph.
+        if (!this.stream || !this.audioCtx || this.audioCtx.state === "closed") {
+          return this.initAudio();
+        }
+      })
+      .then(() => {
+        this.blob = null;
+        if (this.blobURL) URL.revokeObjectURL(this.blobURL);
+        this.blobURL = null;
+        this.recId += 1;
+        this.seq = 0;
+        this.recording = true;
+        const recId = this.recId;
+        this.worker.postMessage({
+          type: "start",
+          recId: recId,
+          data: {rate: this.audioCtx.sampleRate, format: this.format},
+        });
+        if (this.useWorklet) {
+          this.encNode.port.onmessage = (e) => this.onAudioChunk(e.data);
+        } else {
+          this.encNode.onaudioprocess = (e) => {
+            this.onAudioChunk(e.inputBuffer.getChannelData(0));
+          };
+        }
+        this.encNode.connect(this.audioCtx.destination);
+        return new Promise((resolve, reject) => {
+          this.startResolve = resolve;
+          this.startReject = reject;
+        });
+      });
+  }
+
+  onAudioChunk(samples) {
+    if (!this.recording) return;
+    this.worker.postMessage({
+      type: "data",
+      recId: this.recId,
+      seq: this.seq++,
+      data: samples,
+    });
   }
 
   stopRecording() {
-    if (!this.stream) throw new Error("missing audio initialization");
     if (!this.worker) throw new Error("missing worker initialization");
+    if (!this.recording) return Promise.reject(new Error("not recording"));
+    this.recording = false;
     this.encNode.disconnect();
-    this.encNode.onaudioprocess = null;
-    this.stopTracks();
-    this.audioCtx.close();
-    this.worker.postMessage({type: "stop", data: null});
+    if (this.useWorklet) {
+      this.encNode.port.onmessage = null;
+    } else {
+      this.encNode.onaudioprocess = null;
+    }
+    if (this.stream) this.stopTracks();
+    if (this.audioCtx && this.audioCtx.state !== "closed") this.audioCtx.close();
+    const recId = this.recId;
+    this.worker.postMessage({type: "stop", recId: recId});
     return new Promise((resolve, reject) => {
-      this.resolve = resolve;
-      this.reject = reject;
+      this.stopResolve = resolve;
+      this.stopReject = reject;
     });
   }
 
@@ -485,7 +763,7 @@ export class Form {
     this.stopBtn.style.display = "";
     this.saveBtn.disabled = true;
     this.stopBtn.focus();
-    this.recorder.startRecording();
+    this.recorder.startRecording().catch((err) => this.drawError(err));
   }
 
   stopRecording() {
